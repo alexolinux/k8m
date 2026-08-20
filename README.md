@@ -51,23 +51,23 @@ pip install -r requirements.txt
 
 ```shell
 # Monitor pods in the "default" namespace (refreshes every 2s)
-k8m -n default
+python k8m.py -n default
 
 # All namespaces, filtered by label, sorted by CPU usage
-k8m -A --label-selector app=web --sort cpu
+python k8m.py -A --label-selector app=web --sort cpu
 
 # Also watch deployments and HPAs
-k8m -n production --deployments --hpas
+python k8m.py -n production --deployments --hpas
 
 # Use a specific kubeconfig / context
-k8m -n production --kubeconfig ~/.kube/prod.yaml --context prod
+python k8m.py -n production --kubeconfig ~/.kube/prod.yaml --context prod
 
 # One-shot snapshot, exported as JSON / CSV
-k8m -n default --export json
-k8m -A --export csv > snapshot.csv
+python k8m.py -n default --export json
+python k8m.py -A --export csv > snapshot.csv
 
 # Debug logging to a file while the live view runs
-k8m -n default --debug --log-file k8m.log
+python k8m.py -n default --debug --log-file k8m.log
 ```
 
 ## Usage steps
