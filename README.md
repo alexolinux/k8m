@@ -24,30 +24,32 @@ Real-time terminal monitor for Kubernetes pods, deployments and Horizontal Pod A
 
 ## Installation
 
-Install inside a virtual environment (recommended), not system-wide:
+Pull this repo
 
-```bash
-git clone <repo-url> && cd k8m
+```shell
+git clone https://github.com/alexolinux/k8m.git
+cd k8m
+```
+
+Create the required python virtual environment
+
+```shell
+# Using toml
 python3 -m venv .venv          # create the venv
 source .venv/bin/activate      # activate it (or .venv\Scripts\activate on Windows)
 pip install -e .               # installs k8m + deps (kubernetes, rich)
 ```
+Or
 
-This installs the `k8m` command inside the venv — run it while the venv is active (`which k8m` should point into `.venv/bin/`).
-
-Alternatively, run without installing, still from the venv:
-
-```bash
+```shell
+# Using requirements.txt
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python k8m.py -n default
 ```
-
-> Note: the system Python (e.g. `/usr/bin/python3`) does not have the `kubernetes`/`rich` dependencies — the script exits with a "Missing dependency" message unless run with the venv Python.
 
 ## Quick start
 
-```bash
+```shell
 # Monitor pods in the "default" namespace (refreshes every 2s)
 k8m -n default
 
@@ -115,6 +117,10 @@ k8m -n default --debug --log-file k8m.log
 - **CPU/MEM columns show `n/a`** – `metrics-server` is not available. It is required for usage data; everything else still works.
 - **Empty/error table** – check the API error shown in the footer and your kubeconfig (`kubectl get pods` should work first).
 - **Screen "shaking" or log noise** – while the live view is active, nothing is written to stdout/stderr; diagnostics go to `--log-file k8m.log` only.
+
+## Author
+
+https://alexolinux.com
 
 ## License
 
