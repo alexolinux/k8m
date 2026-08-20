@@ -33,14 +33,25 @@ Notes:
 
 import argparse
 import logging
+import os
+import queue
+import select
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+try:
+    import tty
+    import termios
+    _TTY_AVAILABLE = True
+except ImportError:
+    _TTY_AVAILABLE = False
 
 log = logging.getLogger("k8m")
 
@@ -356,6 +367,107 @@ class HPAInfo:
 
 
 # --------------------------------------------------------------------------- #
+# Interactive display state & keyboard input
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class UIState:
+    """Mutable display state updated by keyboard input and consumed by the render loop."""
+    scroll_offset: int = 0
+    sort_by: str = "name"
+    sort_reverse: bool = False
+    filter_text: str = ""
+    filter_mode: bool = False
+
+
+class KeyReader:
+    """Background thread that reads keypresses from stdin and queues them for the render loop.
+
+    Uses ``tty.setcbreak`` so Ctrl-C still raises KeyboardInterrupt while all
+    other keys are delivered one-by-one without waiting for Enter.
+    """
+
+    _ESC_SEQ: Dict[bytes, str] = {
+        b"\x1b[A": "up",    b"\x1b[B": "down",
+        b"\x1b[C": "right", b"\x1b[D": "left",
+        b"\x1b[5~": "pageup",  b"\x1b[6~": "pagedown",
+        b"\x1b[H": "home",    b"\x1b[F": "end",
+        b"\x1b[1~": "home",   b"\x1b[4~": "end",
+        b"\x1b": "escape",
+        b"\x7f": "backspace", b"\x08": "backspace",
+        b"\r": "enter",       b"\n": "enter",
+    }
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._fd = sys.stdin.fileno()
+        self._old_settings = None
+        self._active = False
+
+    def start(self) -> bool:
+        """Put stdin into cbreak mode and start the reader thread.
+
+        Returns True only when stdin is a real TTY and tty/termios are available.
+        """
+        if not _TTY_AVAILABLE or not sys.stdin.isatty():
+            return False
+        try:
+            self._old_settings = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+            self._thread.start()
+            self._active = True
+            return True
+        except (termios.error, AttributeError, OSError):
+            return False
+
+    def stop(self) -> None:
+        """Stop the reader thread and restore the original terminal settings."""
+        self._stop.set()
+        if self._old_settings is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
+            except (termios.error, OSError):
+                pass
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([self._fd], [], [], 0.05)
+                if ready:
+                    data = os.read(self._fd, 32)
+                    if not data:
+                        break
+                    key = self._decode(data)
+                    if key:
+                        self._queue.put(key)
+            except (OSError, ValueError):
+                break
+
+    def _decode(self, data: bytes) -> Optional[str]:
+        if data in self._ESC_SEQ:
+            return self._ESC_SEQ[data]
+        if len(data) == 1 and 0x20 <= data[0] <= 0x7E:
+            return chr(data[0])
+        return None
+
+    def get_keys(self) -> List[str]:
+        """Drain and return all pending keystrokes (non-blocking)."""
+        keys: List[str] = []
+        while True:
+            try:
+                keys.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        return keys
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+
+# --------------------------------------------------------------------------- #
 # Kubernetes data collection
 # --------------------------------------------------------------------------- #
 
@@ -632,41 +744,119 @@ class ClusterCollector:
 # Rendering
 # --------------------------------------------------------------------------- #
 
-def build_table(pods: List[PodInfo], sort_by: str, all_namespaces: bool,
-                metrics_available: bool, now: Optional[datetime] = None) -> Table:
-    title = "Kubernetes Pod Monitor"
-    # Fixed column widths everywhere (width=, not just max_width) so the
-    # table's total width never changes between refreshes — a table that
-    # resizes frame-to-frame is what makes a Live/alt-screen view "shake".
-    table = Table(title=title, expand=False, header_style="bold cyan", show_lines=False)
+# Number-key → pod sort column
+_SORT_KEY_MAP: Dict[str, str] = {
+    "1": "name",    "2": "cpu",    "3": "mem",    "4": "restarts",
+    "5": "age",     "6": "health", "7": "status", "8": "node",
+}
 
-    if all_namespaces:
-        table.add_column("NAMESPACE", style="magenta", width=14, no_wrap=True, overflow="ellipsis")
-    table.add_column("NAME", width=32, no_wrap=True, overflow="ellipsis")
-    table.add_column("READY", justify="center", width=7, no_wrap=True)
-    table.add_column("STATUS", width=10, no_wrap=True, overflow="ellipsis")
-    table.add_column("RESTARTS", justify="right", width=9, no_wrap=True)
-    table.add_column("AGE", justify="right", width=8, no_wrap=True)
-    table.add_column("CPU", justify="right", width=9, no_wrap=True)
-    table.add_column("CPU%", justify="right", width=6, no_wrap=True)
-    table.add_column("MEM", justify="right", width=8, no_wrap=True)
-    table.add_column("MEM%", justify="right", width=6, no_wrap=True)
-    table.add_column("NODE", width=22, no_wrap=True, overflow="ellipsis")
-    table.add_column("QOS", width=10, no_wrap=True)
-    table.add_column("HEALTH", width=28, no_wrap=True, overflow="ellipsis")
+
+def filter_and_sort_pods(pods: List[PodInfo], state: UIState,
+                          all_namespaces: bool) -> List[PodInfo]:
+    """Return pods after applying the text filter and sort order in *state*."""
+    if state.filter_text:
+        needle = state.filter_text.lower()
+        pods = [
+            p for p in pods if
+            needle in p.name.lower() or
+            needle in p.namespace.lower() or
+            needle in p.phase.lower() or
+            needle in p.node.lower()
+        ]
 
     def sort_key(p: PodInfo):
-        if sort_by == "cpu":
-            return -p.cpu_usage_m
-        if sort_by == "mem":
-            return -p.mem_usage_mi
-        if sort_by == "restarts":
-            return -p.total_restarts
-        return p.name
+        if state.sort_by == "cpu":       return -p.cpu_usage_m
+        if state.sort_by == "mem":       return -p.mem_usage_mi
+        if state.sort_by == "restarts":  return -p.total_restarts
+        if state.sort_by == "age":
+            return p.started_at or datetime.min.replace(tzinfo=timezone.utc)
+        if state.sort_by == "health":
+            order = {"critical": 0, "warning": 1, "pending": 2, "healthy": 3, "completed": 4}
+            return order.get(p.health_bucket(), 5)
+        if state.sort_by == "status":    return p.phase
+        if state.sort_by == "node":      return p.node
+        return p.name  # default: name
 
-    for pod in sorted(pods, key=sort_key):
+    return sorted(pods, key=sort_key, reverse=state.sort_reverse)
+
+
+def handle_keys(keys: List[str], state: UIState, max_scroll: int,
+                page_size: int, stop: dict) -> None:
+    """Process a batch of queued keypresses, mutating *state* in place."""
+    for key in keys:
+        # ---- Filter typing mode ------------------------------------------ #
+        if state.filter_mode:
+            if key == "escape":
+                state.filter_mode = False
+                state.filter_text = ""
+                state.scroll_offset = 0
+            elif key == "enter":
+                state.filter_mode = False
+                state.scroll_offset = 0
+            elif key == "backspace":
+                state.filter_text = state.filter_text[:-1]
+                state.scroll_offset = 0
+            elif len(key) == 1:
+                state.filter_text += key
+                state.scroll_offset = 0
+            continue
+
+        # ---- Navigation & commands --------------------------------------- #
+        if key == "q":
+            stop["flag"] = True
+        elif key in ("j", "down"):
+            state.scroll_offset = min(state.scroll_offset + 1, max_scroll)
+        elif key in ("k", "up"):
+            state.scroll_offset = max(state.scroll_offset - 1, 0)
+        elif key == "pagedown":
+            state.scroll_offset = min(state.scroll_offset + page_size, max_scroll)
+        elif key == "pageup":
+            state.scroll_offset = max(state.scroll_offset - page_size, 0)
+        elif key in ("g", "home"):
+            state.scroll_offset = 0
+        elif key in ("G", "end"):
+            state.scroll_offset = max_scroll
+        elif key == "r":
+            state.sort_reverse = not state.sort_reverse
+        elif key == "/":
+            state.filter_mode = True
+        elif key == "escape":
+            state.filter_text = ""
+            state.scroll_offset = 0
+        elif key in _SORT_KEY_MAP:
+            new_sort = _SORT_KEY_MAP[key]
+            if state.sort_by == new_sort:
+                state.sort_reverse = not state.sort_reverse  # second press toggles direction
+            else:
+                state.sort_by = new_sort
+                state.sort_reverse = False
+
+
+def build_table(pods: List[PodInfo], ui_state: UIState, all_namespaces: bool,
+                metrics_available: bool, now: Optional[datetime] = None) -> Table:
+    sort_arrow = "\u25bc" if ui_state.sort_reverse else "\u25b2"
+    filter_indicator = f"  filter:'{ui_state.filter_text}'" if ui_state.filter_text else ""
+    title = f"Kubernetes Pods  (sort: {ui_state.sort_by} {sort_arrow}{filter_indicator})"
+    table = Table(title=title, expand=True, header_style="bold cyan", show_lines=False)
+
+    if all_namespaces:
+        table.add_column("NAMESPACE", style="magenta", ratio=1, min_width=10,
+                         no_wrap=True, overflow="ellipsis")
+    table.add_column("NAME",     ratio=3, min_width=20, no_wrap=True, overflow="ellipsis")
+    table.add_column("READY",    justify="center", min_width=7,  no_wrap=True)
+    table.add_column("STATUS",   min_width=10, no_wrap=True, overflow="ellipsis")
+    table.add_column("RESTARTS", justify="right", min_width=9,  no_wrap=True)
+    table.add_column("AGE",      justify="right", min_width=8,  no_wrap=True)
+    table.add_column("CPU",      justify="right", min_width=9,  no_wrap=True)
+    table.add_column("CPU%",     justify="right", min_width=6,  no_wrap=True)
+    table.add_column("MEM",      justify="right", min_width=8,  no_wrap=True)
+    table.add_column("MEM%",     justify="right", min_width=6,  no_wrap=True)
+    table.add_column("NODE",     ratio=2, min_width=14, no_wrap=True, overflow="ellipsis")
+    table.add_column("QOS",      min_width=10, no_wrap=True, overflow="ellipsis")
+    table.add_column("HEALTH",   ratio=2, min_width=18, no_wrap=True, overflow="ellipsis")
+
+    for pod in pods:
         ready, total = pod.ready_count
-        ready_str = f"{ready}/{total}"
         cpu_p = pct(pod.cpu_usage_m, pod.cpu_limit_m)
         mem_p = pct(pod.mem_usage_mi, pod.mem_limit_mi)
         health_label, health_style = pod.health()
@@ -674,10 +864,9 @@ def build_table(pods: List[PodInfo], sort_by: str, all_namespaces: bool,
         row = []
         if all_namespaces:
             row.append(pod.namespace)
-
         row.extend([
             pod.name,
-            ready_str,
+            f"{ready}/{total}",
             pod.phase,
             str(pod.total_restarts) if pod.total_restarts < 5 else f"[yellow]{pod.total_restarts}[/yellow]",
             fmt_age(pod.started_at, now),
@@ -695,42 +884,36 @@ def build_table(pods: List[PodInfo], sort_by: str, all_namespaces: bool,
 
 
 def build_deployment_table(deployments: List[DeploymentInfo], all_namespaces: bool,
-                           sort_by: str, now: Optional[datetime] = None) -> Table:
-    title = "Kubernetes Deployments"
-    table = Table(title=title, expand=False, header_style="bold cyan", show_lines=False)
+                           sort_by: str, sort_reverse: bool = False,
+                           now: Optional[datetime] = None) -> Table:
+    table = Table(title="Deployments", expand=True, header_style="bold cyan", show_lines=False)
 
     if all_namespaces:
-        table.add_column("NAMESPACE", style="magenta", width=14, no_wrap=True, overflow="ellipsis")
-    table.add_column("NAME", width=32, no_wrap=True, overflow="ellipsis")
-    table.add_column("READY", justify="center", width=9, no_wrap=True)
-    table.add_column("UP-TO-DATE", justify="center", width=11, no_wrap=True)
-    table.add_column("AVAILABLE", justify="center", width=10, no_wrap=True)
-    table.add_column("AGE", justify="right", width=8, no_wrap=True)
-    table.add_column("STRATEGY", width=12, no_wrap=True, overflow="ellipsis")
-    table.add_column("HEALTH", width=30, no_wrap=True, overflow="ellipsis")
+        table.add_column("NAMESPACE",  style="magenta", ratio=1, min_width=10,
+                         no_wrap=True, overflow="ellipsis")
+    table.add_column("NAME",       ratio=3, min_width=20, no_wrap=True, overflow="ellipsis")
+    table.add_column("READY",      justify="center", min_width=9,  no_wrap=True)
+    table.add_column("UP-TO-DATE", justify="center", min_width=11, no_wrap=True)
+    table.add_column("AVAILABLE",  justify="center", min_width=10, no_wrap=True)
+    table.add_column("AGE",        justify="right",  min_width=8,  no_wrap=True)
+    table.add_column("STRATEGY",   min_width=12, no_wrap=True, overflow="ellipsis")
+    table.add_column("HEALTH",     ratio=2, min_width=20, no_wrap=True, overflow="ellipsis")
 
     def sort_key(d: DeploymentInfo):
-        if sort_by == "ready":
-            return -(d.replicas_ready)
-        if sort_by == "age":
-            return d.age
+        if sort_by == "ready": return -(d.replicas_ready)
+        if sort_by == "age":   return d.age
         return d.name
 
-    for dep in sorted(deployments, key=sort_key):
+    for dep in sorted(deployments, key=sort_key, reverse=sort_reverse):
         health_label, health_style = dep.health()
-        ready_str = f"{dep.replicas_ready}/{dep.replicas_desired}"
-        uptodate_str = f"{dep.replicas_updated}/{dep.replicas_desired}"
-        available_str = f"{dep.replicas_available}/{dep.replicas_desired}"
-
         row = []
         if all_namespaces:
             row.append(dep.namespace)
-
         row.extend([
             dep.name,
-            ready_str,
-            uptodate_str,
-            available_str,
+            f"{dep.replicas_ready}/{dep.replicas_desired}",
+            f"{dep.replicas_updated}/{dep.replicas_desired}",
+            f"{dep.replicas_available}/{dep.replicas_desired}",
             dep.age,
             dep.strategy,
             f"[{health_style}]{health_label}[/{health_style}]",
@@ -741,52 +924,43 @@ def build_deployment_table(deployments: List[DeploymentInfo], all_namespaces: bo
 
 
 def build_hpa_table(hpas: List[HPAInfo], all_namespaces: bool, sort_by: str,
-                    now: Optional[datetime] = None) -> Table:
-    title = "Kubernetes Horizontal Pod Autoscalers"
-    table = Table(title=title, expand=False, header_style="bold cyan", show_lines=False)
+                    sort_reverse: bool = False, now: Optional[datetime] = None) -> Table:
+    table = Table(title="Horizontal Pod Autoscalers", expand=True,
+                  header_style="bold cyan", show_lines=False)
 
     if all_namespaces:
-        table.add_column("NAMESPACE", style="magenta", width=14, no_wrap=True, overflow="ellipsis")
-    table.add_column("NAME", width=28, no_wrap=True, overflow="ellipsis")
-    table.add_column("TARGET", width=24, no_wrap=True, overflow="ellipsis")
-    table.add_column("MIN", justify="right", width=5, no_wrap=True)
-    table.add_column("MAX", justify="right", width=5, no_wrap=True)
-    table.add_column("CURRENT", justify="right", width=8, no_wrap=True)
-    table.add_column("DESIRED", justify="right", width=8, no_wrap=True)
-    table.add_column("CPU%", justify="center", width=7, no_wrap=True)
-    table.add_column("MEM%", justify="center", width=7, no_wrap=True)
-    table.add_column("AGE", justify="right", width=8, no_wrap=True)
-    table.add_column("HEALTH", width=30, no_wrap=True, overflow="ellipsis")
+        table.add_column("NAMESPACE", style="magenta", ratio=1, min_width=10,
+                         no_wrap=True, overflow="ellipsis")
+    table.add_column("NAME",    ratio=2, min_width=20, no_wrap=True, overflow="ellipsis")
+    table.add_column("TARGET",  ratio=2, min_width=18, no_wrap=True, overflow="ellipsis")
+    table.add_column("MIN",     justify="right", min_width=5,  no_wrap=True)
+    table.add_column("MAX",     justify="right", min_width=5,  no_wrap=True)
+    table.add_column("CURRENT", justify="right", min_width=8,  no_wrap=True)
+    table.add_column("DESIRED", justify="right", min_width=8,  no_wrap=True)
+    table.add_column("CPU%",    justify="center", min_width=7, no_wrap=True)
+    table.add_column("MEM%",    justify="center", min_width=7, no_wrap=True)
+    table.add_column("AGE",     justify="right",  min_width=8, no_wrap=True)
+    table.add_column("HEALTH",  ratio=2, min_width=20, no_wrap=True, overflow="ellipsis")
 
     def sort_key(h: HPAInfo):
-        if sort_by == "desired":
-            return -h.desired_replicas
-        if sort_by == "current":
-            return -h.current_replicas
-        if sort_by == "age":
-            return h.age
+        if sort_by == "desired": return -h.desired_replicas
+        if sort_by == "current": return -h.current_replicas
+        if sort_by == "age":     return h.age
         return h.name
 
-    for hpa in sorted(hpas, key=sort_key):
+    for hpa in sorted(hpas, key=sort_key, reverse=sort_reverse):
         health_label, health_style = hpa.health()
         target_str = f"{hpa.target_kind}/{hpa.target_name}" if hpa.target_kind and hpa.target_name else "-"
         cpu_str = f"{hpa.cpu_current}/{hpa.cpu_target}" if hpa.cpu_target else "-"
         mem_str = f"{hpa.mem_current}/{hpa.mem_target}" if hpa.mem_target else "-"
-
         row = []
         if all_namespaces:
             row.append(hpa.namespace)
-
         row.extend([
-            hpa.name,
-            target_str,
-            str(hpa.min_replicas),
-            str(hpa.max_replicas),
-            str(hpa.current_replicas),
-            str(hpa.desired_replicas),
-            cpu_str,
-            mem_str,
-            hpa.age,
+            hpa.name, target_str,
+            str(hpa.min_replicas), str(hpa.max_replicas),
+            str(hpa.current_replicas), str(hpa.desired_replicas),
+            cpu_str, mem_str, hpa.age,
             f"[{health_style}]{health_label}[/{health_style}]",
         ])
         table.add_row(*row)
@@ -802,7 +976,9 @@ def health_summary(pods: List[PodInfo]) -> Dict[str, int]:
 
 
 def build_footer(namespace_label: str, interval: int, metrics_available: bool,
-                  error: Optional[str], pods: List[PodInfo], monitor_started_at: datetime) -> Panel:
+                 error: Optional[str], pods: List[PodInfo], monitor_started_at: datetime,
+                 ui_state: UIState, total_filtered: int, total_all: int,
+                 visible_rows: int, key_reader_active: bool) -> Panel:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     counts = health_summary(pods)
 
@@ -814,18 +990,51 @@ def build_footer(namespace_label: str, interval: int, metrics_available: bool,
         f"[dim]{counts['completed']} completed[/dim]"
     )
 
+    # Scroll position
+    if total_filtered > 0:
+        end_row = min(ui_state.scroll_offset + visible_rows, total_filtered)
+        scroll_info = f"[{ui_state.scroll_offset + 1}\u2013{end_row}/{total_filtered}]"
+    else:
+        scroll_info = "[0/0]"
+    if total_filtered < total_all:
+        scroll_info += f" [yellow](of {total_all})[/yellow]"
+
+    sort_arrow = "\u25bc" if ui_state.sort_reverse else "\u25b2"
+
+    # Filter display
+    if ui_state.filter_mode:
+        filter_display = (
+            f"   [bold yellow on black] FILTER: {ui_state.filter_text}\u2588 [/bold yellow on black]"
+        )
+    elif ui_state.filter_text:
+        filter_display = f"   [yellow]filter:[/yellow] [italic]{ui_state.filter_text}[/italic]"
+    else:
+        filter_display = ""
+
     parts = [
         f"[bold]scope:[/bold] {namespace_label}",
-        f"[bold]pods:[/bold] {len(pods)}  ({summary})",
+        f"[bold]pods:[/bold] {len(pods)} ({summary})",
+        f"[bold]scroll:[/bold] {scroll_info}",
+        f"[bold]sort:[/bold] [cyan]{ui_state.sort_by} {sort_arrow}[/cyan]",
         f"[bold]uptime:[/bold] {fmt_age(monitor_started_at)}",
         f"[bold]interval:[/bold] {interval}s",
         f"[bold]updated:[/bold] {ts}",
-        f"[bold]metrics-server:[/bold] {'[green]ok[/green]' if metrics_available else '[red]unavailable[/red]'}",
+        f"[bold]metrics:[/bold] {'[green]ok[/green]' if metrics_available else '[red]n/a[/red]'}",
     ]
     if error:
         parts.append(f"[bold red]error:[/bold red] {error}")
-    parts.append("[dim]Ctrl+C to quit[/dim]")
-    return Panel(Align.left(Text.from_markup("   ".join(parts))), border_style="dim")
+
+    line1 = "   ".join(parts) + filter_display
+
+    if key_reader_active:
+        line2 = (
+            "[dim]j/k \u2191/\u2193:scroll   PgDn/PgUp:page   g/G:top/bot   "
+            "r:reverse   /:filter   Esc:clear   1-8:sort   q:quit[/dim]"
+        )
+    else:
+        line2 = "[dim]Ctrl+C to quit[/dim]"
+
+    return Panel(Align.left(Text.from_markup(f"{line1}\n{line2}")), border_style="dim")
 
 
 # --------------------------------------------------------------------------- #
@@ -857,14 +1066,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interval", type=int, default=2, help="Refresh interval in seconds (default: 2)")
     parser.add_argument("--kubeconfig", default=None, help="Path to kubeconfig file")
     parser.add_argument("--context", default=None, help="Kubeconfig context to use")
-    parser.add_argument("--sort", choices=["name", "cpu", "mem", "restarts"], default="name",
-                         help="Sort pods by column (default: name)")
+    parser.add_argument("--sort",
+                         choices=["name", "cpu", "mem", "restarts", "age", "health", "status", "node"],
+                         default="name",
+                         help="Initial pod sort column (default: name; interactive keys: 1-8)")
+    parser.add_argument("--sort-reverse", action="store_true",
+                         help="Start with sort order reversed")
     parser.add_argument("--label-selector", default=None, help="Label selector e.g. app=web")
-    parser.add_argument("--export", choices=["json", "csv"], help="Export snapshot to stdout instead of live view")
-    parser.add_argument("--cpu-threshold", type=int, default=90, help="CPU warning threshold (1-100)")
-    parser.add_argument("--mem-threshold", type=int, default=90, help="Memory warning threshold (1-100)")
+    parser.add_argument("--export", choices=["json", "csv"],
+                         help="Export a single snapshot to stdout instead of the live view")
+    parser.add_argument("--cpu-threshold", type=int, default=90, help="CPU warning threshold %% (1-100)")
+    parser.add_argument("--mem-threshold", type=int, default=90, help="Memory warning threshold %% (1-100)")
     parser.add_argument("--log-file", default="k8m.log",
-                         help="Where to write logs while the live view is running (default: k8m.log)")
+                         help="Log file while the live view is running (default: k8m.log)")
     parser.add_argument("--debug", action="store_true", help="Enable debug-level logging")
     parser.add_argument("--deployments", action="store_true", help="Also watch deployments")
     parser.add_argument("--hpas", action="store_true", help="Also watch horizontal pod autoscalers")
@@ -880,14 +1094,12 @@ def main():
     args = parser.parse_args()
 
     if args.interval < 1:
-        args.interval = 1  # clamped silently before logging is set up
+        args.interval = 1
 
     for name, val in (("--cpu-threshold", args.cpu_threshold), ("--mem-threshold", args.mem_threshold)):
         if not 1 <= val <= 100:
             parser.error(f"{name} must be between 1 and 100 (got {val})")
 
-    # Only mirror logs to the console when we're not entering the Live
-    # alternate-screen view (export mode prints a single snapshot and exits).
     setup_logging(log_file=args.log_file, debug=args.debug, mirror_console=bool(args.export))
 
     global CPU_WARN_THRESHOLD, MEM_WARN_THRESHOLD
@@ -898,59 +1110,44 @@ def main():
     collector = ClusterCollector(namespace=args.namespace, all_namespaces=args.all_namespaces,
                                   label_selector=args.label_selector)
     console = Console()
-
     namespace_label = "ALL NAMESPACES" if args.all_namespaces else args.namespace
 
+    # ------------------------------------------------------------------ #
+    # Export mode — single snapshot, then exit
+    # ------------------------------------------------------------------ #
     if args.export:
         pods = collector.fetch_pods()
         if args.export == "json":
             import json
-            out = {"pods": [], "deployments": [], "hpas": []}
+            out: Dict = {"pods": [], "deployments": [], "hpas": []}
             for p in pods:
                 out["pods"].append({
-                    "name": p.name,
-                    "namespace": p.namespace,
-                    "phase": p.phase,
-                    "node": p.node,
-                    "qos": p.qos,
+                    "name": p.name, "namespace": p.namespace, "phase": p.phase,
+                    "node": p.node, "qos": p.qos,
                     "ready": f"{p.ready_count[0]}/{p.ready_count[1]}",
                     "restarts": p.total_restarts,
-                    "cpu_usage_m": p.cpu_usage_m,
-                    "mem_usage_mi": p.mem_usage_mi,
+                    "cpu_usage_m": p.cpu_usage_m, "mem_usage_mi": p.mem_usage_mi,
                     "health": p.health()[0],
                 })
             if args.deployments:
-                deployments = collector.fetch_deployments()
-                for d in deployments:
+                for d in collector.fetch_deployments():
                     out["deployments"].append({
-                        "name": d.name,
-                        "namespace": d.namespace,
-                        "replicas_desired": d.replicas_desired,
-                        "replicas_ready": d.replicas_ready,
-                        "replicas_current": d.replicas_current,
-                        "replicas_updated": d.replicas_updated,
+                        "name": d.name, "namespace": d.namespace,
+                        "replicas_desired": d.replicas_desired, "replicas_ready": d.replicas_ready,
+                        "replicas_current": d.replicas_current, "replicas_updated": d.replicas_updated,
                         "replicas_available": d.replicas_available,
-                        "age": d.age,
-                        "strategy": d.strategy,
-                        "health": d.health()[0],
+                        "age": d.age, "strategy": d.strategy, "health": d.health()[0],
                     })
             if args.hpas:
-                hpas = collector.fetch_hpas()
-                for h in hpas:
+                for h in collector.fetch_hpas():
                     out["hpas"].append({
-                        "name": h.name,
-                        "namespace": h.namespace,
+                        "name": h.name, "namespace": h.namespace,
                         "target": f"{h.target_kind}/{h.target_name}",
-                        "min_replicas": h.min_replicas,
-                        "max_replicas": h.max_replicas,
-                        "current_replicas": h.current_replicas,
-                        "desired_replicas": h.desired_replicas,
-                        "cpu_target": h.cpu_target,
-                        "cpu_current": h.cpu_current,
-                        "mem_target": h.mem_target,
-                        "mem_current": h.mem_current,
-                        "age": h.age,
-                        "health": h.health()[0],
+                        "min_replicas": h.min_replicas, "max_replicas": h.max_replicas,
+                        "current_replicas": h.current_replicas, "desired_replicas": h.desired_replicas,
+                        "cpu_target": h.cpu_target, "cpu_current": h.cpu_current,
+                        "mem_target": h.mem_target, "mem_current": h.mem_current,
+                        "age": h.age, "health": h.health()[0],
                     })
             print(json.dumps(out, indent=2))
         else:
@@ -960,27 +1157,38 @@ def main():
                               "restarts", "cpu_usage_m", "mem_usage_mi", "health"])
             for p in pods:
                 writer.writerow([p.namespace, p.name, p.phase, p.node, p.qos,
-                                  f"{p.ready_count[0]}/{p.ready_count[1]}", p.total_restarts,
-                                  p.cpu_usage_m, p.mem_usage_mi, p.health()[0]])
+                                  f"{p.ready_count[0]}/{p.ready_count[1]}",
+                                  p.total_restarts, p.cpu_usage_m, p.mem_usage_mi, p.health()[0]])
             if args.deployments:
-                deployments = collector.fetch_deployments()
                 writer.writerow([])
-                writer.writerow(["namespace", "name", "desired", "ready", "current", "updated", "available", "age", "strategy", "health"])
-                for d in deployments:
+                writer.writerow(["namespace", "name", "desired", "ready", "current",
+                                  "updated", "available", "age", "strategy", "health"])
+                for d in collector.fetch_deployments():
                     writer.writerow([d.namespace, d.name, d.replicas_desired, d.replicas_ready,
                                       d.replicas_current, d.replicas_updated, d.replicas_available,
                                       d.age, d.strategy, d.health()[0]])
             if args.hpas:
-                hpas = collector.fetch_hpas()
                 writer.writerow([])
-                writer.writerow(["namespace", "name", "target", "min", "max", "current", "desired", "cpu%", "mem%", "age", "health"])
-                for h in hpas:
-                    writer.writerow([h.namespace, h.name, f"{h.target_kind}/{h.target_name}",
-                                      h.min_replicas, h.max_replicas, h.current_replicas, h.desired_replicas,
-                                      f"{h.cpu_current}/{h.cpu_target}" if h.cpu_target else "-",
-                                      f"{h.mem_current}/{h.mem_target}" if h.mem_target else "-",
-                                      h.age, h.health()[0]])
+                writer.writerow(["namespace", "name", "target", "min", "max",
+                                  "current", "desired", "cpu%", "mem%", "age", "health"])
+                for h in collector.fetch_hpas():
+                    writer.writerow([
+                        h.namespace, h.name, f"{h.target_kind}/{h.target_name}",
+                        h.min_replicas, h.max_replicas, h.current_replicas, h.desired_replicas,
+                        f"{h.cpu_current}/{h.cpu_target}" if h.cpu_target else "-",
+                        f"{h.mem_current}/{h.mem_target}" if h.mem_target else "-",
+                        h.age, h.health()[0],
+                    ])
         return
+
+    # ------------------------------------------------------------------ #
+    # Interactive live view
+    # ------------------------------------------------------------------ #
+    ui_state = UIState(sort_by=args.sort, sort_reverse=args.sort_reverse)
+
+    key_reader = KeyReader()
+    key_reader_active = key_reader.start()
+    log.info("Interactive key reader: %s", "enabled" if key_reader_active else "disabled (not a TTY)")
 
     stop = {"flag": False}
 
@@ -995,52 +1203,82 @@ def main():
             while not stop["flag"]:
                 error = None
                 try:
-                    start = time.monotonic()
+                    t0 = time.monotonic()
                     pods = collector.fetch_pods()
                     deployments = collector.fetch_deployments() if args.deployments else []
                     hpas = collector.fetch_hpas() if args.hpas else []
-                    elapsed = (time.monotonic() - start) * 1000
+                    elapsed = (time.monotonic() - t0) * 1000
                     log.info("Fetched %d pods, %d deployments, %d HPAs in %.0f ms",
                              len(pods), len(deployments), len(hpas), elapsed)
                 except ApiException as e:
-                    pods = []
-                    deployments = []
-                    hpas = []
+                    pods = []; deployments = []; hpas = []
                     error = f"{e.status} {e.reason}"
                     log.warning("API error: %s", error)
                 except Exception as e:
-                    pods = []
-                    deployments = []
-                    hpas = []
+                    pods = []; deployments = []; hpas = []
                     error = str(e)
                     log.exception("Unexpected error fetching resources")
 
                 now = datetime.now(timezone.utc)
-                pod_table = build_table(pods, args.sort, args.all_namespaces, collector._metrics_available, now)
-                tables = [pod_table]
 
+                # Estimate visible pod rows based on terminal height.
+                # Overhead: pod-table header area (4) + footer panel (4) +
+                # each extra table consumes ~12 lines on average.
+                extra_tables = (1 if args.deployments else 0) + (1 if args.hpas else 0)
+                visible_rows = max(1, console.height - 8 - extra_tables * 12)
+
+                # Pre-build static tables (deployments, HPAs) — only rebuilt on each API cycle.
+                static_tables: List = []
                 if args.deployments:
-                    dep_table = build_deployment_table(deployments, args.all_namespaces, args.deployment_sort, now)
-                    tables.append(dep_table)
-
+                    static_tables.append(
+                        build_deployment_table(deployments, args.all_namespaces,
+                                               args.deployment_sort, now=now))
                 if args.hpas:
-                    hpa_table = build_hpa_table(hpas, args.all_namespaces, args.hpa_sort, now)
-                    tables.append(hpa_table)
+                    static_tables.append(
+                        build_hpa_table(hpas, args.all_namespaces, args.hpa_sort, now=now))
 
-                footer = build_footer(namespace_label, args.interval, collector._metrics_available,
-                                       error, pods, monitor_started_at)
+                # Inner render + key-input loop for one refresh interval.
+                sleep_end = time.monotonic() + max(1, args.interval)
+                while True:
+                    remaining = sleep_end - time.monotonic()
+                    if remaining <= 0 or stop["flag"]:
+                        break
 
-                if len(tables) > 1:
-                    live.update(Group(*tables, footer))
-                else:
-                    live.update(Group(pod_table, footer))
+                    # Apply filter/sort, clamp scroll offset.
+                    sorted_filtered = filter_and_sort_pods(pods, ui_state, args.all_namespaces)
+                    total_filtered = len(sorted_filtered)
+                    total_all = len(pods)
+                    max_scroll = max(0, total_filtered - visible_rows)
+                    ui_state.scroll_offset = min(ui_state.scroll_offset, max_scroll)
 
-                time.sleep(max(1, args.interval))
+                    visible_pods = sorted_filtered[
+                        ui_state.scroll_offset: ui_state.scroll_offset + visible_rows
+                    ]
+
+                    pod_table = build_table(visible_pods, ui_state, args.all_namespaces,
+                                            collector._metrics_available, now)
+                    footer = build_footer(
+                        namespace_label, args.interval, collector._metrics_available,
+                        error, pods, monitor_started_at,
+                        ui_state, total_filtered, total_all, visible_rows, key_reader_active,
+                    )
+                    live.update(Group(pod_table, *static_tables, footer))
+
+                    # Sleep in 50 ms increments for low-latency key handling.
+                    time.sleep(min(0.05, remaining))
+
+                    if key_reader_active:
+                        keys = key_reader.get_keys()
+                        if keys:
+                            handle_keys(keys, ui_state, max_scroll, visible_rows, stop)
+
     except KeyboardInterrupt:
         pass
     finally:
+        key_reader.stop()
         console.print("[dim]Stopped.[/dim]")
 
 
 if __name__ == "__main__":
     main()
+
